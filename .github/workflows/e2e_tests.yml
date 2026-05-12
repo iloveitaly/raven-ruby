@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  packages: read
 
 concurrency:
   group: e2e-tests-${{ github.head_ref || github.run_id }}
@@ -23,28 +24,37 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ruby_version: ["3.4.5"]
-
-    env:
-      DOCKER_IMAGE: "ghcr.io/getsentry/sentry-ruby-devcontainer-3.4"
-      DOCKER_TAG: "d54d0ea1ee3e0d49f2b86d2689278447ccbbe0f9"
+        include:
+          - ruby_version: "3.4.9"
+            flavor: "3.4"
+          - ruby_version: "4.0.3"
+            flavor: "4.0"
 
     steps:
       - name: Checkout code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Read devcontainer version
+        id: devcontainer-version
+        run: echo "version=$(cat .devcontainer/VERSION)" >> $GITHUB_OUTPUT
+
       - name: Set up `.env` file
         run: |
           cd .devcontainer
           cp .env.example .env
+          echo "RUBY_VERSION=${{ matrix.ruby_version }}" >> .env
+          echo "DOCKER_IMAGE=ghcr.io/getsentry/sentry-ruby-devcontainer-${{ matrix.flavor }}" >> .env
+          echo "DOCKER_TAG=${{ steps.devcontainer-version.outputs.version }}" >> .env
 
-      - name: Restore rubygems cache
-        uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
         with:
-          path: vendor/gems
-          key: ${{ runner.os }}-${{ matrix.ruby_version }}-gems-${{ hashFiles('Gemfile.lock', '*/Gemfile.lock', 'spec/apps/**/Gemfile.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.ruby_version }}-gems-
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull test container image
+        run: docker pull ghcr.io/getsentry/sentry-ruby-devcontainer-${{ matrix.flavor }}:${{ steps.devcontainer-version.outputs.version }}
 
       - name: Restore node_modules cache
         uses: actions/cache@6f8efc29b200d32929f49075959781ed54ec270c # v3
@@ -59,15 +69,17 @@ jobs:
           docker compose \
             --file .devcontainer/docker-compose.yml \
             --env-file .devcontainer/.env \
+            --profile e2e \
             run --rm sentry-test \
-            echo "Done"
+            .devcontainer/setup --only .,spec/apps/rails-mini
 
       - name: Start test services
         run: |
           docker compose \
             --file .devcontainer/docker-compose.yml \
             --env-file .devcontainer/.env \
-            up -d sentry-test
+            --profile e2e \
+            up -d --no-build sentry-test
 
       - name: "Wait for rails-mini app to be ready"
         uses: nev7n/wait_for_response@81b0b0eded16435202e126beb3e704fc00430f5b # v1
@@ -90,12 +102,13 @@ jobs:
           docker compose \
             --file .devcontainer/docker-compose.yml \
             --env-file .devcontainer/.env \
+            --profile e2e \
             exec sentry-test \
             bundle exec rake
 
       - name: Stop e2e services
         if: always()
-        run: docker compose --file .devcontainer/docker-compose.yml down
+        run: docker compose --file .devcontainer/docker-compose.yml --profile e2e down
 
       - name: Upload test artifacts
         if: failure()
