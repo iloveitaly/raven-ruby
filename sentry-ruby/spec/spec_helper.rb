@@ -125,6 +125,14 @@ module TestHelpers
     RUBY_VERSION.public_send(op, version)
   end
 
+  def self.fiber_storage?
+    Fiber.respond_to?(:[]) && Fiber.respond_to?(:[]=)
+  end
+
+  def self.no_fiber_storage?
+    !fiber_storage?
+  end
+
   def self.ruby_engine?(engine)
     RUBY_ENGINE == engine
   end

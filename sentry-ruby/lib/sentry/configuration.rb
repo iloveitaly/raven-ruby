@@ -389,6 +389,23 @@ module Sentry
     # @return [Boolean]
     attr_accessor :strict_trace_continuation
 
+    # Which execution primitive owns the SDK's current hub.
+    #
+    # [+:thread+ (default)] Store the hub in thread-local storage. Correct for
+    #   thread-based servers (Puma, Unicorn) and background processors (Sidekiq,
+    #   Resque). Every fiber on a thread shares one hub.
+    # [+:fiber+] Store the hub in Fiber Storage (Ruby 3.2+). Each fiber gets its
+    #   own hub and child fibers inherit it, so concurrent requests on a
+    #   fiber-based server (Falcon/async) are isolated instead of sharing and
+    #   corrupting one another's scope. Requested on a Ruby without Fiber
+    #   Storage (< 3.2), the SDK logs a warning and falls back to +:thread+.
+    #
+    # @return [Symbol]
+    attr_reader :hub_isolation_level
+
+    # Isolation levels the SDK understands for hub storage.
+    ISOLATION_LEVELS = %i[thread fiber].freeze
+
     # these are not config options
     # @!visibility private
     attr_reader :errors, :gem_specs
@@ -541,6 +558,7 @@ module Sentry
       self.capture_queue_time = true
       self.org_id = nil
       self.strict_trace_continuation = false
+      self.hub_isolation_level = :thread
 
       spotlight_env = ENV["SENTRY_SPOTLIGHT"]
       spotlight_bool = Sentry::Utils::EnvHelper.env_to_bool(spotlight_env, strict: true)
@@ -608,6 +626,23 @@ module Sentry
       check_argument_type!(value, String, NilClass)
 
       @release = value
+    end
+
+    def hub_isolation_level=(level)
+      level = level.to_sym if level.respond_to?(:to_sym)
+
+      unless ISOLATION_LEVELS.include?(level)
+        raise ArgumentError, "hub_isolation_level must be one of #{ISOLATION_LEVELS.inspect}, got #{level.inspect}"
+      end
+
+      # :fiber relies on Fiber Storage (Ruby 3.2+); downgrade so the hub is never
+      # asked to call Fiber[] on a Ruby that lacks it.
+      if level == :fiber && !fiber_storage_available?
+        log_warn("hub_isolation_level :fiber requires Ruby 3.2+ Fiber Storage; falling back to :thread on Ruby #{RUBY_VERSION}.")
+        level = :thread
+      end
+
+      @hub_isolation_level = level
     end
 
     def breadcrumbs_logger=(logger)
@@ -805,6 +840,10 @@ module Sentry
     end
 
     private
+
+    def fiber_storage_available?
+      ::Fiber.respond_to?(:[]) && ::Fiber.respond_to?(:[]=)
+    end
 
     def init_dsn(dsn_string)
       return if dsn_string.nil? || dsn_string.empty?
