@@ -70,6 +70,12 @@ module Sentry
         OP_NAME = "queue.process"
         SPAN_ORIGIN = "auto.queue.active_job"
 
+        # Emitted as messaging.system when the configured queue adapter's
+        # identity cannot be resolved from the job. ActiveJob is adapter-agnostic
+        # and supports arbitrary third-party backends, so the concrete value is
+        # normally derived from the adapter itself; this is only the last resort.
+        MESSAGING_SYSTEM_FALLBACK = "activejob"
+
         EVENT_HANDLERS = {
           "enqueue_retry.active_job" => :retry_handler
         }
@@ -97,8 +103,13 @@ module Sentry
               Sentry.with_child_span(op: "queue.publish", description: job.class.name) do |span|
                 if span
                   span.set_origin(SPAN_ORIGIN)
+                  span.set_data(Sentry::Span::DataConventions::MESSAGING_SYSTEM, messaging_system(job))
                   span.set_data(Sentry::Span::DataConventions::MESSAGING_MESSAGE_ID, job.job_id)
                   span.set_data(Sentry::Span::DataConventions::MESSAGING_DESTINATION_NAME, job.queue_name)
+
+                  if (count = retry_count(job))
+                    span.set_data(Sentry::Span::DataConventions::MESSAGING_MESSAGE_RETRY_COUNT, count)
+                  end
                 end
 
                 run_enqueue.call
@@ -169,20 +180,39 @@ module Sentry
           end
 
           def set_messaging_data(transaction, job)
+            transaction.set_data(Sentry::Span::DataConventions::MESSAGING_SYSTEM, messaging_system(job))
             transaction.set_data(Sentry::Span::DataConventions::MESSAGING_MESSAGE_ID, job.job_id)
             transaction.set_data(Sentry::Span::DataConventions::MESSAGING_DESTINATION_NAME, job.queue_name)
-            transaction.set_data(Sentry::Span::DataConventions::MESSAGING_MESSAGE_RETRY_COUNT, [job.executions.to_i - 1, 0].max)
+            if (count = retry_count(job))
+              transaction.set_data(Sentry::Span::DataConventions::MESSAGING_MESSAGE_RETRY_COUNT, count)
+            end
 
             if (latency = compute_latency(job))
               transaction.set_data(Sentry::Span::DataConventions::MESSAGING_MESSAGE_RECEIVE_LATENCY, latency)
             end
           end
 
+          def messaging_system(job)
+            name = job.class.queue_adapter_name if job.class.respond_to?(:queue_adapter_name)
+            name = name.to_s
+            name.empty? ? MESSAGING_SYSTEM_FALLBACK : name
+          end
+
+          # Number of retries the job has already gone through, as observed at
+          # the moment the span is opened. On the consumer the span opens before
+          # ActiveJob increments +executions+, so a job's first attempt reads 0,
+          # its first retry reads 1, and so on. On the producer the retry enqueue
+          # runs after the failed attempt bumped +executions+, so it observes the
+          # same progression.
+          def retry_count(job)
+            job.executions.to_i if job.respond_to?(:executions)
+          end
+
           def compute_latency(job)
             return unless job.respond_to?(:enqueued_at) && job.enqueued_at
 
             enqueued_time = job.enqueued_at.is_a?(String) ? Time.parse(job.enqueued_at) : job.enqueued_at
-            ((Time.now.to_f - enqueued_time.to_f) * 1000).round
+            (Time.now.to_f - enqueued_time.to_f) * 1000.0
           end
 
           def capture_exception(job, e)
